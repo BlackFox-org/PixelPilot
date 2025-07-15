@@ -701,9 +701,9 @@
                 android:layout_height="wrap_content"
                 android:layout_gravity="center"
                 android:text=""
+                android:textColor="@android:color/white"
                 android:textSize="14sp"
-                android:visibility="gone"
-                android:textColor="@android:color/white" />
+                android:visibility="gone" />
         </com.openipc.pixelpilot.osd.MovableLayout>
     </FrameLayout>
 

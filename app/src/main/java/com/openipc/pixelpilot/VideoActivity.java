@@ -81,10 +81,25 @@ import java.util.Locale;
 import java.util.Timer;
 import java.util.TimerTask;
 
+// For ssh
+import net.schmizz.sshj.SSHClient;
+import net.schmizz.sshj.connection.channel.direct.Session;
+import net.schmizz.sshj.transport.verification.PromiscuousVerifier;
+import net.schmizz.sshj.common.IOUtils;
+
+import org.spongycastle.jce.provider.BouncyCastleProvider;
+import java.security.Security;
+
 // Most basic implementation of an activity that uses VideoNative to stream a video
 // Into an Android Surface View
 public class VideoActivity extends AppCompatActivity implements IVideoParamsChanged,
         WfbNGStatsChanged, MavlinkUpdate, SettingsChanged {
+
+    static {
+        Security.removeProvider("BC"); // Remove default Bouncy Castle if present
+        Security.insertProviderAt(new BouncyCastleProvider(), 1); // Insert Spongy Castle
+    }
+
     private static final String TAG = "pixelpilot";
     private static final int PICK_KEY_REQUEST_CODE = 1;
     private static final int PICK_DVR_REQUEST_CODE = 2;
@@ -569,6 +584,8 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
         // Help submenu
         setupHelpSubMenu(popup);
 
+        setupUpgradeSubMenu(popup);
+
         popup.show();
     }
 
@@ -878,6 +895,23 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
         });
     }
 
+    private void setupUpgradeSubMenu(PopupMenu popup) {
+        SubMenu recording = popup.getMenu().addSubMenu("OTA Upgrade");
+
+        MenuItem upgBtn = recording.add(dvrFd == null ? "Start" : "Stop");
+        upgBtn.setOnMenuItemClickListener(item -> {
+            new Thread(() -> {
+                try {
+                    String sshResult = SSHUtil.executeCommand("fw_printenv -n upgrade");
+                    runOnUiThread(() -> Toast.makeText(this, "Reboot command sent: " + sshResult, Toast.LENGTH_SHORT).show());
+                } catch (IOException e) {
+                    runOnUiThread(() -> Toast.makeText(this, "Failed to send reboot command: " + e.getMessage(), Toast.LENGTH_SHORT).show());
+                }
+            }).start();
+            return true;
+        });
+
+    }
     /**
      * Submenu for drone settings.
      */
@@ -1521,5 +1555,29 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
                 handler.proceed("root", "12345");
             }
         });
+    }
+
+    public static class SSHUtil {
+        private static final String HOST = "10.5.0.10"; // Replace with your designated IP
+        private static final int PORT = 22; // Default SSH port
+        private static final String USERNAME = "root"; // Replace with your SSH username
+        private static final String PASSWORD = "12345"; // Replace with your SSH password
+
+        public static String executeCommand(String command) throws IOException {
+            SSHClient ssh = new SSHClient();
+            ssh.addHostKeyVerifier(new PromiscuousVerifier()); // Accepts any host key (not secure for production)
+            ssh.connect(HOST, PORT);
+            try {
+                ssh.authPassword(USERNAME, PASSWORD);
+                try (Session session = ssh.startSession()) {
+                    final Session.Command cmd = session.exec(command);
+                    String response = IOUtils.readFully(cmd.getInputStream()).toString();
+                    cmd.join();
+                    return response;
+                }
+            } finally {
+                ssh.disconnect();
+            }
+        }
     }
 }
