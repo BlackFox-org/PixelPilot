@@ -64,8 +64,10 @@ import com.openipc.wfbngrtl8812.WfbNGStatsChanged;
 import com.openipc.wfbngrtl8812.WfbNgLink;
 
 import java.io.BufferedReader;
+import java.net.URL;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.FileWriter;
 import java.io.IOException;
@@ -89,6 +91,9 @@ import net.schmizz.sshj.common.IOUtils;
 
 import org.spongycastle.jce.provider.BouncyCastleProvider;
 import java.security.Security;
+import java.util.concurrent.TimeUnit;
+
+import javax.net.ssl.HttpsURLConnection;
 
 // Most basic implementation of an activity that uses VideoNative to stream a video
 // Into an Android Surface View
@@ -898,19 +903,36 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
     private void setupUpgradeSubMenu(PopupMenu popup) {
         SubMenu recording = popup.getMenu().addSubMenu("OTA Upgrade");
 
-        MenuItem upgBtn = recording.add(dvrFd == null ? "Start" : "Stop");
-        upgBtn.setOnMenuItemClickListener(item -> {
+        MenuItem downloadBtn = recording.add("Download and Transfer and perform update");
+        downloadBtn.setOnMenuItemClickListener(item -> {
             new Thread(() -> {
+                File tempFile = null;
                 try {
-                    String sshResult = SSHUtil.executeCommand("fw_printenv -n upgrade");
-                    runOnUiThread(() -> Toast.makeText(this, "Reboot command sent: " + sshResult, Toast.LENGTH_SHORT).show());
+                    String url = SSHUtil.executeCommand("fw_printenv -n upgrade");
+                    SSHUtil.executeCommand("killall majestic");
+                    int lastSepar = url.lastIndexOf('/');
+                    String upgName = url.substring(lastSepar + 1);
+                    tempFile = new File(getCacheDir(), upgName);
+                    downloadFile(url, tempFile);
+                    runOnUiThread(() -> Toast.makeText(this, "File downloaded successfully", Toast.LENGTH_SHORT).show());
+
+                    String result = SSHUtil.transferFile(tempFile, "/tmp/" + upgName);
+                    runOnUiThread(() -> Toast.makeText(this, result, Toast.LENGTH_LONG).show());
+                    SSHUtil.executeCommand("sysupgrade --archive=/tmp/" + upgName + " -n -f");
+                    runOnUiThread(() -> Toast.makeText(this, "Sysupgrade exeCUTEd", Toast.LENGTH_SHORT).show());
                 } catch (IOException e) {
-                    runOnUiThread(() -> Toast.makeText(this, "Failed to send reboot command: " + e.getMessage(), Toast.LENGTH_SHORT).show());
+                    Log.e(TAG, "Download or transfer failed", e);
+                    runOnUiThread(() -> Toast.makeText(this, "Failed to download or transfer file: " + e.getMessage(), Toast.LENGTH_LONG).show());
+                } finally {
+                    if (tempFile != null && tempFile.exists()) {
+                        if (!tempFile.delete()) {
+                            Log.w(TAG, "Failed to delete temporary file: " + tempFile.getAbsolutePath());
+                        }
+                    }
                 }
             }).start();
             return true;
         });
-
     }
     /**
      * Submenu for drone settings.
@@ -1557,27 +1579,248 @@ public class VideoActivity extends AppCompatActivity implements IVideoParamsChan
         });
     }
 
-    public static class SSHUtil {
-        private static final String HOST = "10.5.0.10"; // Replace with your designated IP
-        private static final int PORT = 22; // Default SSH port
-        private static final String USERNAME = "root"; // Replace with your SSH username
-        private static final String PASSWORD = "12345"; // Replace with your SSH password
+    public class SSHUtil {
+        private static final String HOST = "10.5.0.10";
+        private static final String USERNAME = "root";
+        private static final String PASSWORD = "12345";
+        private static final String TAG = "SSHUtil";
+        private static final int TIMEOUT_SECONDS = 20; // 60s for commands
+        private static final int CONNECT_TIMEOUT_MS = 20000; // 60s connection timeout
+        private static final int MAX_RETRIES = 5; // Number of retries
+        private static final int CHUNK_SIZE = 4 * 1024; // 4KB chunks
+        private static final Object lock = new Object(); // Synchronization lock
+        private static SSHClient sshClient = null; // Singleton SSHClient
+
+        private static SSHClient getSSHClient() throws IOException {
+            synchronized (lock) {
+                if (sshClient == null || !sshClient.isConnected() || !sshClient.isAuthenticated()) {
+                    if (sshClient != null) {
+                        try {
+                            sshClient.disconnect();
+                        } catch (Exception ignored) {
+                        }
+                        sshClient = null;
+                    }
+                    sshClient = new SSHClient();
+                    sshClient.addHostKeyVerifier(new PromiscuousVerifier());
+                    sshClient.setConnectTimeout(CONNECT_TIMEOUT_MS);
+                    sshClient.setTimeout(CONNECT_TIMEOUT_MS);
+                    sshClient.getConnection().getKeepAlive().setKeepAliveInterval(30); // Keep-alive every 30s
+                    sshClient.connect(HOST, 22);
+                    sshClient.authPassword(USERNAME, PASSWORD);
+                    Log.d(TAG, "SSHClient initialized: connected=" + sshClient.isConnected() + ", authenticated=" + sshClient.isAuthenticated());
+                }
+                return sshClient;
+            }
+        }
 
         public static String executeCommand(String command) throws IOException {
-            SSHClient ssh = new SSHClient();
-            ssh.addHostKeyVerifier(new PromiscuousVerifier()); // Accepts any host key (not secure for production)
-            ssh.connect(HOST, PORT);
-            try {
-                ssh.authPassword(USERNAME, PASSWORD);
-                try (Session session = ssh.startSession()) {
-                    final Session.Command cmd = session.exec(command);
-                    String response = IOUtils.readFully(cmd.getInputStream()).toString();
-                    cmd.join();
-                    return response;
+            synchronized (lock) {
+                int attempt = 0;
+                while (attempt < MAX_RETRIES) {
+                    try (Session session = getSSHClient().startSession()) {
+                        Log.d(TAG, "Executing command: " + command);
+                        try (Session.Command cmd = session.exec(command)) {
+                            String response = IOUtils.readFully(cmd.getInputStream()).toString("UTF-8").trim();
+                            String error = IOUtils.readFully(cmd.getErrorStream()).toString("UTF-8").trim();
+                            cmd.join(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                            Integer exitStatus = cmd.getExitStatus();
+                            if (exitStatus == null || exitStatus != 0) {
+                                throw new IOException("Command failed with exit code " + (exitStatus != null ? exitStatus : "unknown") + ": " + error);
+                            }
+                            Log.d(TAG, "Command executed successfully: " + response);
+                            return response;
+                        }
+                    } catch (IOException e) {
+                        attempt++;
+                        Log.w(TAG, "Command execution attempt " + attempt + "/" + MAX_RETRIES + " failed: " + command, e);
+                        if (attempt >= MAX_RETRIES) {
+                            Log.e(TAG, "Command execution failed after " + MAX_RETRIES + " attempts: " + command, e);
+                            throw new IOException("Failed to execute command: " + e.getMessage(), e);
+                        }
+                        try {
+                            Thread.sleep(5000); // Wait 5s before retrying
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            throw new IOException("Interrupted during retry delay", ie);
+                        }
+                        synchronized (lock) {
+                            if (sshClient != null) {
+                                try {
+                                    sshClient.disconnect();
+                                } catch (Exception ignored) {
+                                }
+                                sshClient = null;
+                            }
+                        }
+                    }
                 }
-            } finally {
-                ssh.disconnect();
+                throw new IOException("Unexpected error: retries exhausted for command: " + command);
+            }
+        }
+
+        public static String transferFile(File sourceFile, String destinationPath) throws IOException {
+            synchronized (lock) {
+                if (!sourceFile.exists()) {
+                    Log.e(TAG, "Source file does not exist: " + sourceFile.getAbsolutePath());
+                    return "Source file does not exist: " + sourceFile.getAbsolutePath();
+                }
+
+                // Check file size to prevent overwhelming the server
+                if (sourceFile.length() > 50 * 1024 * 1024) { // 50MB limit
+                    Log.e(TAG, "File too large for transfer: " + sourceFile.length() + " bytes");
+                    return "File too large for transfer (>50MB)";
+                }
+
+                // Verify server has 'cat'
+                String testCommand = executeCommand("command -v cat");
+                if (testCommand.isEmpty()) {
+                    Log.e(TAG, "Server lacks 'cat' command");
+                    return "Server lacks required command (cat)";
+                }
+
+                int attempt = 0;
+                while (attempt < MAX_RETRIES) {
+                    SSHClient client = null;
+                    try {
+                        client = getSSHClient();
+                        Log.d(TAG, "Starting file transfer to " + destinationPath + ", file size: " + sourceFile.length() + " bytes");
+
+                        // Step 1: Remove existing destination file
+                        try (Session session = client.startSession()) {
+                            try (Session.Command rmCmd = session.exec("rm -f " + destinationPath)) {
+                                rmCmd.join(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                                String rmError = IOUtils.readFully(rmCmd.getErrorStream()).toString("UTF-8").trim();
+                                Integer rmExitStatus = rmCmd.getExitStatus();
+                                if (rmExitStatus == null || rmExitStatus != 0) {
+                                    throw new IOException("Failed to remove destination file: " + rmError);
+                                }
+                            }
+                        }
+
+                        // Step 2: Stream file in chunks using cat
+                        try (FileInputStream fis = new FileInputStream(sourceFile)) {
+                            try (Session session = client.startSession()) {
+                                String command = "cat > " + destinationPath; // Use cat to write directly
+                                Log.d(TAG, "Executing streaming command: " + command);
+                                try (Session.Command cmd = session.exec(command)) {
+                                    OutputStream out = cmd.getOutputStream();
+                                    byte[] buffer = new byte[CHUNK_SIZE];
+                                    int bytesRead;
+                                    int chunkCount = 0;
+                                    while ((bytesRead = fis.read(buffer)) != -1) {
+                                        out.write(buffer, 0, bytesRead);
+                                        out.flush();
+                                        Log.d(TAG, "Sent chunk " + chunkCount + ", size: " + bytesRead + " bytes");
+                                        chunkCount++;
+                                    }
+                                    out.close();
+                                    cmd.join(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                                    String error = IOUtils.readFully(cmd.getErrorStream()).toString("UTF-8").trim();
+                                    Integer exitStatus = cmd.getExitStatus();
+                                    if (exitStatus == null || exitStatus != 0) {
+                                        throw new IOException("Failed to stream file: " + error);
+                                    }
+                                }
+                            }
+                        }
+
+                        Log.d(TAG, "File transfer completed successfully to " + destinationPath);
+                        return "File transferred successfully to " + destinationPath;
+                    } catch (IOException e) {
+                        attempt++;
+                        Log.w(TAG, "File transfer attempt " + attempt + "/" + MAX_RETRIES + " failed: " + e.getMessage(), e);
+                        if (attempt >= MAX_RETRIES) {
+                            Log.e(TAG, "File transfer failed after " + MAX_RETRIES + " attempts: " + e.getMessage(), e);
+                            return "File transfer failed: " + e.getMessage();
+                        }
+                        try {
+                            Thread.sleep(5000); // Wait 5s before retrying
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            return "File transfer interrupted";
+                        }
+                        synchronized (lock) {
+                            if (client != null) {
+                                try {
+                                    client.disconnect();
+                                } catch (Exception ignored) {
+                                }
+                                sshClient = null;
+                            }
+                        }
+                    }
+                }
+                return "File transfer failed: retries exhausted";
             }
         }
     }
+    private void downloadFile(String fileUrl, File destination) throws IOException {
+        HttpsURLConnection connection = null;
+        InputStream inputStream = null;
+        FileOutputStream outputStream = null;
+        try {
+            URL url = new URL(fileUrl);
+            connection = (HttpsURLConnection) url.openConnection();
+            connection.setConnectTimeout(10000); // 10 seconds
+            connection.setReadTimeout(10000); // 10 seconds
+            connection.setRequestMethod("GET");
+
+            // Optional: Configure SSL settings (e.g., for self-signed certificates, if needed)
+            // Note: For production, ensure the server has a valid, trusted certificate
+            // If using a self-signed certificate, you may need to add a custom TrustManager
+            // Example (uncomment for self-signed certificates, but use cautiously):
+        /*
+        SSLContext sslContext = SSLContext.getInstance("TLS");
+        TrustManager[] trustAll = new TrustManager[] { new X509TrustManager() {
+            @Override
+            public void checkClientTrusted(X509Certificate[] chain, String authType) {}
+            @Override
+            public void checkServerTrusted(X509Certificate[] chain, String authType) {}
+            @Override
+            public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
+        }};
+        sslContext.init(null, trustAll, new SecureRandom());
+        connection.setSSLSocketFactory(sslContext.getSocketFactory());
+        connection.setHostnameVerifier((hostname, session) -> true);
+        */
+
+            int responseCode = connection.getResponseCode();
+            if (responseCode != HttpsURLConnection.HTTP_OK) {
+                throw new IOException("HTTPS error code: " + responseCode + " - " + connection.getResponseMessage());
+            }
+
+            inputStream = connection.getInputStream();
+            outputStream = new FileOutputStream(destination);
+
+            byte[] buffer = new byte[4096];
+            int bytesRead;
+            while ((bytesRead = inputStream.read(buffer)) != -1) {
+                outputStream.write(buffer, 0, bytesRead);
+            }
+            outputStream.flush();
+        } catch (IOException e) {
+            // Capture more specific SSL-related errors
+            throw new IOException("Failed to download file from " + fileUrl + ": " + e.getMessage(), e);
+        } finally {
+            if (inputStream != null) {
+                try {
+                    inputStream.close();
+                } catch (IOException e) {
+                    Log.w(TAG, "Failed to close input stream", e);
+                }
+            }
+            if (outputStream != null) {
+                try {
+                    outputStream.close();
+                } catch (IOException e) {
+                    Log.w(TAG, "Failed to close output stream", e);
+                }
+            }
+            if (connection != null) {
+                connection.disconnect();
+            }
+        }
+    }
+
 }
